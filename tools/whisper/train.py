@@ -98,7 +98,6 @@ class WhisperDataset(Dataset):
 class WhisperModel(LightningModule):
     def __init__(self):
         super().__init__()
-        self.save_hyperparameters()
 
         self.model = AlignedWhisper.load("medium", len(phonemes), n_outputs=256)
 
@@ -169,7 +168,7 @@ if __name__ == "__main__":
         gradient_clip_val=1,
         accumulate_grad_batches=16,
         max_epochs=100,
-        precision=16,
+        precision="16-mixed",
         callbacks=[
             ModelCheckpoint(
                 filename="{epoch}-{val_loss:.4f}-{val_acc:.4f}",

@@ -34,32 +34,45 @@ def viz_synth_sample(
     gt_pitch,
     predict_mel,
     predict_mel_len,
+    gt_mel_len,
     vocoder,
     return_image=False,
 ):
-    mel_len = predict_mel_len.item()
-    pitch = gt_pitch[:mel_len]
-    mel_target = gt_mel[:mel_len].float().detach().T
-    mel_prediction = predict_mel[:mel_len].float().detach().T
+    predict_mel_len = predict_mel_len.item()
+    gt_mel_len = gt_mel_len.item()
 
-    fig_mels = plot_mel(
-        [
-            mel_prediction.cpu().numpy(),
-            mel_target.cpu().numpy(),
-            (mel_prediction - mel_target).abs().cpu().numpy(),
-        ],
-        ["Sampled Spectrogram", "Ground-Truth Spectrogram", "Difference"],
-    )
+    pitch = gt_pitch[:gt_mel_len] if gt_pitch is not None else None
+    mel_target = gt_mel[:gt_mel_len].float().detach().T
+    mel_prediction = predict_mel[:predict_mel_len].float().detach().T
+
+    mels = [
+        mel_prediction.cpu().numpy(),
+        mel_target.cpu().numpy(),
+    ]
+    titles = ["Sampled Spectrogram", "Ground-Truth Spectrogram"]
+
+    if mel_prediction.shape == mel_target.shape:
+        mels.append((mel_prediction - mel_target).abs().cpu().numpy())
+        titles.append("Difference")
+
+    fig_mels = plot_mel(mels, titles)
 
     wav_reconstruction = vocoder.spec2wav(mel_target, pitch)
     wav_prediction = vocoder.spec2wav(mel_prediction, pitch)
 
-    wav_reconstruction = loudness_norm(
-        wav_reconstruction.cpu().float().numpy(), 44100, block_size=0.1
-    )
-    wav_prediction = loudness_norm(
-        wav_prediction.cpu().float().numpy(), 44100, block_size=0.1
-    )
+    try:
+        wav_reconstruction = loudness_norm(
+            wav_reconstruction.cpu().float().numpy(), 44100, block_size=0.1
+        )
+    except:
+        wav_reconstruction = wav_reconstruction.cpu().float().numpy()
+
+    try:
+        wav_prediction = loudness_norm(
+            wav_prediction.cpu().float().numpy(), 44100, block_size=0.1
+        )
+    except:
+        wav_prediction = wav_prediction.cpu().float().numpy()
 
     wav_reconstruction = torch.from_numpy(wav_reconstruction)
     wav_prediction = torch.from_numpy(wav_prediction)

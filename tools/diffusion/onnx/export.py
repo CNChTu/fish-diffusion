@@ -45,7 +45,9 @@ def export_feature_embedding(model, device):
 
     n_frames = 10
     speakers = torch.tensor([0], dtype=torch.long, device=device)
-    text_features = torch.randn((n_frames, 256), device=device)
+    text_features = torch.randn(
+        (n_frames, model.model.text_encoder.input_size), device=device
+    )
     pitches = torch.rand((n_frames,), device=device)
     pitch_shift = None
 
@@ -103,7 +105,9 @@ def export_diffusion(config, model, device):
     step = torch.randint(
         0, config.model.diffusion.timesteps, (1,), device=device, dtype=torch.long
     )
-    cond = torch.randn((1, config.hidden_size, n_frames), device=device)
+    cond = torch.randn(
+        (1, config.model.diffusion.denoiser.condition_dim, n_frames), device=device
+    )
 
     model.diffusion.denoise_fn = torch.jit.trace(
         model.diffusion.denoise_fn, (x, step, cond), check_trace=True
@@ -144,7 +148,9 @@ def export_diffusion(config, model, device):
 
     logger.info("PLMS noise predictor traced.")
 
-    condition = torch.rand((1, 20, config.hidden_size), device=device)
+    condition = torch.rand(
+        (1, 20, config.model.diffusion.denoiser.condition_dim), device=device
+    )
     sampler_interval = torch.tensor(100, dtype=torch.long, device=device)
 
     torch.manual_seed(0)
@@ -213,9 +219,9 @@ class FeatureExtractorWrapper(torch.nn.Module):
 
 
 def export_feature_extractor(config, device):
-    if config.preprocessing.text_features_extractor.type == "ContentVec":
-        logger.warning("ContentVec is not supported in ONNX. Skip exporting.")
-        return
+    # if config.preprocessing.text_features_extractor.type == "ContentVec":
+    #     logger.warning("ContentVec is not supported in ONNX. Skip exporting.")
+    #     return
 
     feature_extractor = FEATURE_EXTRACTORS.build(
         config.preprocessing.text_features_extractor

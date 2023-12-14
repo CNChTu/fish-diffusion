@@ -8,7 +8,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
-from fish_audio_preprocess.utils import loudness_norm
+from fish_audio_preprocess.utils import loudness_norm, separate_audio
 from loguru import logger
 from mmengine import Config
 from natsort import natsorted
@@ -22,6 +22,28 @@ from fish_diffusion.utils.audio import separate_vocals, slice_audio
 from fish_diffusion.utils.inference import load_checkpoint
 from fish_diffusion.utils.tensor import repeat_expand
 
+# from tqdm import tqdm
+# path = Path("dataset/train/aria")
+# all_nps = list(path.rglob("*.npy"))[:5000]
+
+# all_data = []
+# for file in tqdm(all_nps):
+#     try:
+#         x = np.load(file, allow_pickle=True).item()
+#         all_data.append(x['contents'].T)
+#     except:
+#         pass
+
+# # import faiss
+# XX = np.concatenate(all_data, axis=0).astype(np.float32)
+# quantizer = faiss.IndexFlatL2(1024)
+# index = faiss.IndexIVFFlat(quantizer, 1024, 100)
+# assert not index.is_trained
+# index.train(XX)
+# assert index.is_trained
+# index.add(XX)
+# print("Index built")
+
 
 class SVCInference(nn.Module):
     def __init__(self, config, checkpoint, model_cls=DiffSingerLightning):
@@ -32,11 +54,13 @@ class SVCInference(nn.Module):
         self.text_features_extractor = FEATURE_EXTRACTORS.build(
             config.preprocessing.text_features_extractor
         )
-        self.pitch_extractor = PITCH_EXTRACTORS.build(
-            config.preprocessing.pitch_extractor
-        )
 
-        if hasattr(config.preprocessing, "energy_extractor"):
+        if getattr(config.preprocessing, "pitch_extractor", None):
+            self.pitch_extractor = PITCH_EXTRACTORS.build(
+                config.preprocessing.pitch_extractor
+            )
+
+        if getattr(config.preprocessing, "energy_extractor", None):
             self.energy_extractor = ENERGY_EXTRACTORS.build(
                 config.preprocessing.energy_extractor
             )
@@ -52,6 +76,7 @@ class SVCInference(nn.Module):
         self.model = load_checkpoint(
             config, checkpoint, device="cpu", model_cls=model_cls
         )
+        self.separate_model = None
 
     @property
     def device(self):
@@ -66,20 +91,29 @@ class SVCInference(nn.Module):
         speakers: torch.Tensor = 0,
         sampler_progress: bool = False,
         sampler_interval: Optional[int] = None,
+        noise_predictor: Optional[str] = None,
         pitches: Optional[torch.Tensor] = None,
+        skip_steps: int = 0,
     ):
-        mel_len = audio.shape[-1] // 512
+        if skip_steps > 0:
+            original_mel = self.model.vocoder.wav2spec(audio, sr)[None]
+            original_mel = original_mel.to(self.device)
+            mel_len = original_mel.shape[-1]
+        else:
+            original_mel = None
+            mel_len = audio.shape[-1] // 512
 
         # Extract and process pitch
-        if pitches is None:
-            pitches = self.pitch_extractor(audio, sr, pad_to=mel_len).float()
-        else:
-            pitches = repeat_expand(pitches, mel_len)
+        if hasattr(self, "pitch_extractor") and self.pitch_extractor is not None:
+            if pitches is None:
+                pitches = self.pitch_extractor(audio, sr, pad_to=mel_len).float()
+            else:
+                pitches = repeat_expand(pitches, mel_len)
 
-        if (pitches == 0).all():
-            return np.zeros((audio.shape[-1],))
+            if (pitches == 0).all():
+                return np.zeros((audio.shape[-1],))
 
-        pitches *= 2 ** (pitch_adjust / 12)
+            pitches *= 2 ** (pitch_adjust / 12)
 
         # Extract and process text features
         text_features = self.text_features_extractor(audio, sr)[0]
@@ -97,23 +131,31 @@ class SVCInference(nn.Module):
 
         # Predict
         contents_lens = torch.tensor([mel_len]).to(self.device)
+        model = (
+            self.model.ema_model
+            if hasattr(self.model, "ema_model")
+            else self.model.model
+        )
 
-        features = self.model.model.forward_features(
+        features = model.forward_features(
             speakers=speakers.to(self.device),
             contents=text_features[None].to(self.device),
             contents_lens=contents_lens,
             contents_max_len=max(contents_lens),
             mel_lens=contents_lens,
             mel_max_len=max(contents_lens),
-            pitches=pitches[None].to(self.device),
+            pitches=pitches[None].to(self.device) if pitches is not None else None,
             pitch_shift=pitch_shift,
             energy=energy,
         )
 
-        result = self.model.model.diffusion(
+        result = model.diffusion(
             features["features"],
             progress=sampler_progress,
             sampler_interval=sampler_interval,
+            noise_predictor=noise_predictor,
+            skip_steps=skip_steps,
+            original_mel=original_mel,
         )
         wav = self.model.vocoder.spec2wav(result[0].T, f0=pitches).cpu().numpy()
 
@@ -139,7 +181,7 @@ class SVCInference(nn.Module):
 
         if recursive is False:
             logger.error(f"Invalid speaker: {speaker}")
-            return None
+            exit()
 
         # Speaker mix
         speaker = speaker.split(",")
@@ -189,9 +231,11 @@ class SVCInference(nn.Module):
         extract_vocals=True,
         sampler_progress=False,
         sampler_interval=None,
+        noise_predictor=None,
         gradio_progress=None,
         min_silence_duration=0,
         pitches_path=None,
+        skip_steps=0,
     ):
         """Inference
 
@@ -205,9 +249,11 @@ class SVCInference(nn.Module):
             extract_vocals: extract vocals
             sampler_progress: show sampler progress
             sampler_interval: sampler interval
+            noise_predictor: noise predictor, can be naive, unipc, plms
             gradio_progress: gradio progress callback
             min_silence_duration: minimum silence duration
             pitches_path: disable pitch extraction and use the pitch from the given path
+            skip_steps: skip steps
         """
 
         if isinstance(input_path, str) and os.path.isdir(input_path):
@@ -237,6 +283,7 @@ class SVCInference(nn.Module):
                     extract_vocals=extract_vocals,
                     sampler_interval=sampler_interval,
                     sampler_progress=sampler_progress,
+                    noise_predictor=noise_predictor,
                     gradio_progress=gradio_progress,
                     min_silence_duration=min_silence_duration,
                 )
@@ -260,8 +307,11 @@ class SVCInference(nn.Module):
 
             if gradio_progress is not None:
                 gradio_progress(0, "Extracting vocals...")
-
-            audio, _ = separate_vocals(audio, sr, self.device)
+            if self.separate_model is None:
+                self.separate_model = separate_audio.init_model(
+                    "htdemucs", device=self.device
+                )
+            audio, _ = separate_vocals(audio, sr, self.device, self.separate_model)
 
         # Normalize loudness
         audio = loudness_norm.loudness_norm(audio, sr)
@@ -318,7 +368,9 @@ class SVCInference(nn.Module):
                 speakers=speakers,
                 sampler_progress=sampler_progress,
                 sampler_interval=sampler_interval,
+                noise_predictor=noise_predictor,
                 pitches=pitches_segment,
+                skip_steps=skip_steps,
             )
             max_wav_len = generated_audio.shape[-1] - start
             generated_audio[start : start + wav.shape[-1]] = wav[:max_wav_len]
@@ -429,6 +481,14 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--noise_predictor",
+        type=str,
+        default=None,
+        required=False,
+        help="Noise predictor, can be naive, unipc, plms",
+    )
+
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -464,6 +524,14 @@ def parse_args():
         type=str,
         default=None,
         help="Pitch extractor",
+    )
+
+    # Shallow diffusion
+    parser.add_argument(
+        "--skip_steps",
+        type=int,
+        default=0,
+        help="Skip steps and use original audio as input",
     )
 
     return parser.parse_args()
@@ -515,7 +583,9 @@ if __name__ == "__main__":
             extract_vocals=args.extract_vocals,
             sampler_progress=args.sampler_progress,
             sampler_interval=args.sampler_interval,
+            noise_predictor=args.noise_predictor,
             silence_threshold=args.silence_threshold,
             max_slice_duration=args.max_slice_duration,
             min_silence_duration=args.min_silence_duration,
+            skip_steps=args.skip_steps,
         )

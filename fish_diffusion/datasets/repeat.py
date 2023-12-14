@@ -1,4 +1,4 @@
-from typing import Iterable, Union
+from typing import Union
 
 from torch.utils.data import Dataset
 

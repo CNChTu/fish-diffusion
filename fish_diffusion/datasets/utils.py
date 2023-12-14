@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from .builder import DATASETS
 from .repeat import RepeatDataset
+from .sample import SampleDataset
 
 
 def build_loader_from_config(cfg, num_devices=1):
@@ -19,7 +20,7 @@ def build_loader_from_config(cfg, num_devices=1):
 
     valid_dataset = DATASETS.build(cfg.dataset.valid)
 
-    if num_devices > 1:
+    if num_devices > 1 and isinstance(valid_dataset, (RepeatDataset, SampleDataset)):
         valid_dataset = RepeatDataset(
             valid_dataset, repeat=num_devices, collate_fn=valid_dataset.collate_fn
         )
@@ -122,6 +123,8 @@ def transform_pipeline(pipeline, data):
             for k, t in step["keys"]:
                 if isinstance(data[k], np.ndarray):
                     data[k] = torch.from_numpy(data[k]).type(t)
+                elif isinstance(data[k], torch.Tensor):
+                    data[k] = data[k].type(t)
                 else:
                     data[k] = torch.tensor(data[k], dtype=t)
         elif step["type"] == "Transpose":
@@ -133,6 +136,14 @@ def transform_pipeline(pipeline, data):
                     data[k] = np.expand_dims(data[k], *args)
                 else:
                     data[k] = data[k].unsqueeze(*args)
+        elif step["type"] == "FilterByLength":
+            data = [
+                i
+                for i in data
+                if step["min_length"]
+                <= i[step["key"]].shape[step["dim"]]
+                <= step["max_length"]
+            ]
         else:
             raise NotImplementedError(f"Unknown transform type: {step['type']}")
 

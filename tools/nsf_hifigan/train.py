@@ -26,12 +26,12 @@ from fish_diffusion.utils.audio import dynamic_range_compression, get_mel_transf
 from fish_diffusion.utils.viz import plot_mel
 
 torch.set_float32_matmul_precision("medium")
+torch.backends.cudnn.allow_tf32 = True
 
 
 class HSFHifiGAN(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
-        self.save_hyperparameters()
 
         with open(config.model.config) as f:
             data = f.read()
@@ -55,7 +55,7 @@ class HSFHifiGAN(pl.LightningModule):
             n_mels=self.h.num_mels,
         )
 
-        # The bellow are for training
+        # The below are for training
         self.multi_scale_mels = [
             get_mel_transform(
                 sample_rate=self.h.sampling_rate,
@@ -94,17 +94,35 @@ class HSFHifiGAN(pl.LightningModule):
 
         return [optim_g, optim_d], [scheduler_g, scheduler_d]
 
+    def generator_envelope_loss(self, y, y_hat):
+        def extract_envelope(signal, kernel_size=100, stride=50):
+            envelope = F.max_pool1d(signal, kernel_size=kernel_size, stride=stride)
+            return envelope
+
+        y_envelope = extract_envelope(y)
+        y_hat_envelope = extract_envelope(y_hat)
+
+        y_reverse_envelope = extract_envelope(-y)
+        y_hat_reverse_envelope = extract_envelope(-y_hat)
+
+        loss_envelope = F.l1_loss(y_envelope, y_hat_envelope) + F.l1_loss(
+            y_reverse_envelope, y_hat_reverse_envelope
+        )
+
+        return loss_envelope
+
     def training_step(self, batch, batch_idx):
         optim_g, optim_d = self.optimizers()
 
-        mels, pitches, y = (
-            batch["mel"].float(),
+        pitches, y = (
             batch["pitches"].float(),
             batch["audio"].float(),
         )
 
+        mel_lens = batch["audio_lens"] // self.config["hop_length"]
+        mels = self.get_mels(y)[:, :, : mel_lens.max()]
         y_g_hat = self.generator(mels, pitches)
-        optim_d.zero_grad()
+        y_g_hat_mel = self.get_mels(y_g_hat)[:, :, : mel_lens.max()]
 
         # MPD
         y_df_hat_r, y_df_hat_g, _, _ = self.mpd(y, y_g_hat.detach())
@@ -127,7 +145,6 @@ class HSFHifiGAN(pl.LightningModule):
             prog_bar=True,
             logger=True,
             sync_dist=True,
-            batch_size=batch["mel"].shape[0],
         )
 
         # Generator
@@ -167,6 +184,16 @@ class HSFHifiGAN(pl.LightningModule):
 
         loss_aux = 0.5 * loss_stft + loss_mel
 
+        # L1 Envelope Loss
+        loss_envelope = self.generator_envelope_loss(y, y_g_hat)
+        self.log(
+            "train_loss_g_envelope",
+            loss_envelope,
+            on_step=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
+
         # Discriminator Loss
         y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_g_hat)
         y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_g_hat)
@@ -174,7 +201,14 @@ class HSFHifiGAN(pl.LightningModule):
         loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
         loss_gen_f, _ = generator_loss(y_df_hat_g)
         loss_gen_s, _ = generator_loss(y_ds_hat_g)
-        loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_aux * 45
+        loss_gen_all = (
+            loss_gen_s
+            + loss_gen_f
+            + loss_fm_s
+            + loss_fm_f
+            + loss_envelope
+            + loss_aux * 45
+        )
 
         self.manual_backward(loss_gen_all)
         optim_g.step()
@@ -187,7 +221,6 @@ class HSFHifiGAN(pl.LightningModule):
             prog_bar=True,
             logger=True,
             sync_dist=True,
-            batch_size=batch["mel"].shape[0],
         )
 
         # Manual LR Scheduler
@@ -207,17 +240,18 @@ class HSFHifiGAN(pl.LightningModule):
         return dynamic_range_compression(x)
 
     def validation_step(self, batch, batch_idx):
-        mels, pitches, audios = (
-            batch["mel"].float(),
+        pitches, audios = (
             batch["pitches"].float(),
             batch["audio"].float(),
         )
 
+        mel_lens = batch["audio_lens"] // self.config["hop_length"]
+
+        mels = self.get_mels(audios)[:, :, : mel_lens.max()]
         y_g_hat = self.generator(mels, pitches)
-        y_g_hat_mel = self.get_mels(y_g_hat)[:, :, : mels.shape[2]]
+        y_g_hat_mel = self.get_mels(y_g_hat)[:, :, : mel_lens.max()]
 
         # L1 Mel-Spectrogram Loss
-        mel_lens = batch["mel_lens"]
         # create mask
         mask = (
             torch.arange(mels.shape[2], device=mels.device)[None, :] < mel_lens[:, None]
@@ -233,7 +267,6 @@ class HSFHifiGAN(pl.LightningModule):
             prog_bar=True,
             logger=True,
             sync_dist=True,
-            batch_size=batch["mel"].shape[0],
         )
 
         for idx, (mel, gen_mel, audio, gen_audio, mel_len, audio_len) in enumerate(
@@ -242,7 +275,7 @@ class HSFHifiGAN(pl.LightningModule):
                 y_g_hat_mel.cpu().numpy(),
                 audios.cpu().type(torch.float32).numpy(),
                 y_g_hat.type(torch.float32).cpu().numpy(),
-                batch["mel_lens"].cpu().numpy(),
+                mel_lens.cpu().numpy(),
                 batch["audio_lens"].cpu().numpy(),
             )
         ):

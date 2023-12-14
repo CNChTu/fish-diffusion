@@ -10,6 +10,7 @@ from fish_diffusion.archs.diffsinger import DiffSingerLightning
 from fish_diffusion.datasets.utils import build_loader_from_config
 
 torch.set_float32_matmul_precision("medium")
+torch.backends.cudnn.allow_tf32 = True
 
 
 if __name__ == "__main__":
@@ -53,6 +54,35 @@ if __name__ == "__main__":
         state_dict = {
             k: v for k, v in state_dict.items() if not k.startswith("vocoder.")
         }
+
+        if getattr(model, "ema_model", None) is None and any(
+            k.startswith("ema_model.") for k in state_dict.keys()
+        ):
+            logger.warning(
+                f"EMA model doesn't exist in config, drop all models and replace with ema_model."
+            )
+            state_dict = {
+                k.replace("ema_model.", "model."): v
+                for k, v in state_dict.items()
+                if k.startswith("ema_model.")
+            }
+
+        # If model.speaker_encoder.embedding.weight doesn't match, we need to drop it.
+        if state_dict.get("model.speaker_encoder.embedding.weight") is not None:
+            if (
+                state_dict["model.speaker_encoder.embedding.weight"].shape
+                != model.model.speaker_encoder.embedding.weight.shape
+            ):
+                logger.warning(f"Speaker embedding mismatch, rebuilding from scratch.")
+                del state_dict["model.speaker_encoder.embedding.weight"]
+
+        # Do the same for the EMA model.
+        if state_dict.get("ema_model.speaker_encoder.embedding.weight") is not None:
+            if (
+                state_dict["ema_model.speaker_encoder.embedding.weight"].shape
+                != model.ema_model.speaker_encoder.embedding.weight.shape
+            ):
+                del state_dict["ema_model.speaker_encoder.embedding.weight"]
 
         result = model.load_state_dict(state_dict, strict=False)
 

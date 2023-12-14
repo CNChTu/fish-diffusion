@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torchcrepe
-from fish_audio_preprocess.utils.file import list_files
+from fish_audio_preprocess.utils.file import AUDIO_EXTENSIONS, list_files
 from loguru import logger
 from mmengine import Config
 from tqdm import tqdm
@@ -48,7 +48,7 @@ def init(
     logger.info(f"Rank {rank} uses device {device}")
 
     text_features_extractor = None
-    if hasattr(config.preprocessing, "text_features_extractor"):
+    if getattr(config.preprocessing, "text_features_extractor", None):
         text_features_extractor = FEATURE_EXTRACTORS.build(
             config.preprocessing.text_features_extractor
         )
@@ -56,14 +56,16 @@ def init(
         text_features_extractor.eval()
 
     pitch_extractor = None
-    if hasattr(config.preprocessing, "pitch_extractor"):
+    if getattr(config.preprocessing, "pitch_extractor", None):
         if config.preprocessing.pitch_extractor.type == "CrepePitchExtractor":
             torchcrepe.load.model(device, "full")
 
         pitch_extractor = PITCH_EXTRACTORS.build(config.preprocessing.pitch_extractor)
+        pitch_extractor.to(device)
+        pitch_extractor.eval()
 
     energy_extractor = None
-    if hasattr(config.preprocessing, "energy_extractor"):
+    if getattr(config.preprocessing, "energy_extractor", None):
         energy_extractor = ENERGY_EXTRACTORS.build(
             config.preprocessing.energy_extractor
         )
@@ -71,7 +73,7 @@ def init(
         energy_extractor.eval()
 
     vocoder = None
-    if hasattr(config.model, "vocoder"):
+    if getattr(config.model, "vocoder", None):
         vocoder = VOCODERS.build(config.model.vocoder)
         vocoder.to(device)
         vocoder.eval()
@@ -91,6 +93,7 @@ def process(
     idx: int = 0,
     key_shift: float = 0,
     time_stretch: float = 1.0,
+    loudness: Optional[float] = None,
 ):
     if model_caches is None:
         init(config)
@@ -112,6 +115,14 @@ def process(
 
     audio, sr = librosa.load(str(audio_path), sr=config.sampling_rate, mono=True)
 
+    # Change loudness
+    max_loudness = np.max(np.abs(audio))
+
+    if loudness is not None:
+        audio = audio * (loudness / (max_loudness + 1e-5))
+    elif max_loudness > 1.0:
+        audio = audio / (max_loudness + 1e-5)
+
     # If time_stretch is > 1, the audio length will be shorter (speed up)
     if time_stretch != 1.0:
         audio = librosa.effects.time_stretch(audio, rate=time_stretch)
@@ -130,13 +141,16 @@ def process(
         sample["mel"] = mel.cpu().numpy()
     else:
         # Calculate mel length from audio length
-        mel_length = int(audio.shape[-1] / 512) + 1
+        hop_length = getattr(config, "hop_length", 512)
+        mel_length = int(audio.shape[-1] / hop_length) + 1
 
     # Extract text features
     if text_features_extractor is not None:
         if config.model.type == "DiffSinger":
             contents, phones2mel = text_features_extractor(audio_path, mel_length)
             sample["phones2mel"] = phones2mel.cpu().numpy()
+        if config.model.type == "GradTTS":
+            contents = text_features_extractor(audio_path)
         else:
             contents = text_features_extractor(audio, sr)[0]
             contents = repeat_expand(contents, mel_length)
@@ -192,11 +206,17 @@ def safe_process(args, config, audio_path: Path):
                     assert len(augmentation.factors) == 2
                     factor = random.uniform(*augmentation.factors)
                     process(config, audio_path, idx=aug_count, time_stretch=factor)
+                elif augmentation.type == "RandomLoudness":
+                    assert len(augmentation.loudnesses) == 2
+                    loudness = random.uniform(*augmentation.loudnesses)
+                    process(config, audio_path, idx=aug_count, loudness=loudness)
 
         return aug_count + 1
     except Exception as e:
         logger.error(f"Error processing {audio_path}")
-        logger.exception(e)
+
+        if args.debug:
+            logger.exception(e)
 
 
 def parse_args():
@@ -207,12 +227,13 @@ def parse_args():
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--no-augmentation", action="store_true")
+    parser.add_argument("--debug", action="store_true")
 
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
+    # mp.set_start_method("spawn", force=True)
 
     args = parse_args()
 
@@ -233,7 +254,7 @@ if __name__ == "__main__":
         logger.info("Done!")
 
     config = Config.fromfile(args.config)
-    files = list_files(args.path, {".wav"}, recursive=True, sort=False)
+    files = list_files(args.path, AUDIO_EXTENSIONS, recursive=True, sort=False)
     logger.info(f"Found {len(files)} files, processing...")
 
     # Shuffle files will balance the workload of workers
